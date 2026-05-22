@@ -1,231 +1,180 @@
 // ═══════════════════════════════════════════════════════════════
-//  NITROZEN BACKEND v3  —  yt-dlp powered audio extraction
-//  Single file. No broken npm extractors. Pure reliability.
+//  NITROZEN BACKEND v4  —  Lavalink Powered Music Streaming
+//  Dual node support with automatic failover
 // ═══════════════════════════════════════════════════════════════
 
-const express = require("express");
-const cors = require("cors");
-const ytSearch = require("yt-search");
-const { spawn } = require("child_process");
+const express = require('express');
+const cors = require('cors');
+const { Shoukaku } = require('shoukaku');
+const { LAVALINK_NODES } = require('./config/lavalink');
+const { PORT, PUBLIC_URL, NODE_HEALTH_CHECK_INTERVAL, POSITION_UPDATE_INTERVAL } = require('./config/constants');
+const logger = require('./utils/logger');
+const LavalinkNodePool = require('./services/nodePool');
+const PlayerService = require('./services/playerService');
+const { router: apiRouter, setDependencies: setApiDependencies } = require('./routes/api');
+const { createWebSocketServer, setDependencies: setWsDependencies } = require('./routes/websocket');
 
 const app = express();
-const PORT = process.env.SERVER_PORT || process.env.PORT || 3000;
-const os = require("os");
 
+// Middleware
 app.use(cors());
+app.use(express.json());
 
-// ─── REQUEST LOGGER ─────────────────────────────────────────
+// Request logger
 app.use((req, res, next) => {
-  console.log(`\n📡 [${new Date().toLocaleTimeString()}] ${req.method} ${req.originalUrl}`);
+  logger.info(`${req.method} ${req.originalUrl}`);
   next();
 });
 
+// Initialize services
+const nodePool = new LavalinkNodePool();
+const playerService = new PlayerService(nodePool);
 
+// Set dependencies
+setApiDependencies(playerService, nodePool);
+setWsDependencies(playerService, nodePool);
+
+// API Routes
+app.use('/api/v1', apiRouter);
 
 // ═══════════════════════════════════════════════════════════════
-//  GET /  —  Health check
+//  Initialize Shoukaku (Lavalink Client)
 // ═══════════════════════════════════════════════════════════════
-app.get("/", (_req, res) => {
-  console.log("✅ HEALTH CHECK — client connected");
-  res.json({ status: "ok", message: "Nitrozen Backend v3 🎵" });
+
+const shoukakuOptions = {
+  moveOnDisconnect: true,
+  resumable: true,
+  resumableTimeout: 30,
+  reconnectTries: 5,
+  restTimeout: 10000
+};
+
+const nodes = LAVALINK_NODES.map(node => ({
+  name: node.name,
+  url: `${node.secure ? 'wss' : 'ws'}://${node.host}:${node.port}`,
+  auth: node.password,
+  resume: true,
+  resumeKey: `nitrozen-${node.name}`,
+  resumeTimeout: 60
+}));
+
+const shoukaku = new Shoukaku(shoukakuOptions, nodes);
+
+// Shoukaku event handlers
+shoukaku.on('ready', (name) => {
+  logger.success(`Lavalink node ${name} is ready`);
+  nodePool.markNodeConnected(name);
 });
 
-// ═══════════════════════════════════════════════════════════════
-//  GET /search?q=  —  Search YouTube via yt-search
-// ═══════════════════════════════════════════════════════════════
-app.get("/search", async (req, res) => {
-  const query = req.query.q;
-  console.log(`\n🔍 [SEARCH] query: "${query}"`);
-
-  if (!query) {
-    console.log("❌ [SEARCH] Missing ?q= parameter");
-    return res.status(400).json({ status: "error", error: "Missing ?q= parameter" });
-  }
-
-  try {
-    const { videos } = await ytSearch(query);
-    const results = videos.slice(0, 5).map((v) => ({
-      id: v.videoId,
-      title: v.title,
-      artist: v.author.name,
-      thumbnail: v.thumbnail,
-      duration: v.timestamp,
-      durationSeconds: v.seconds,
-    }));
-
-    console.log(`✅ [SEARCH] Found ${results.length} results:`);
-    results.forEach((s, i) => console.log(`   ${i + 1}. ${s.title} [${s.duration}]`));
-
-    res.json({ status: "ok", results });
-  } catch (err) {
-    console.error(`❌ [SEARCH] FAILED: ${err.message}`);
-    res.status(500).json({ status: "error", error: "Search failed", detail: err.message });
-  }
+shoukaku.on('error', (name, error) => {
+  logger.error(`Lavalink node ${name} error`, error);
+  nodePool.markNodeFailure(name, error.message);
 });
 
-const https = require("https");
-const ytdl = require("@distube/ytdl-core");
-
-// List of public Piped instances to avoid 429
-const PIPED_INSTANCES = [
-  "https://pipedapi.kavin.rocks",
-  "https://pipedapi.in.projectsegfau.lt",
-  "https://api.piped.projectsegfau.lt"
-];
-
-async function getPipedAudioUrl(videoId) {
-  for (const api of PIPED_INSTANCES) {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 5000);
-      const res = await fetch(`${api}/streams/${videoId}`, { signal: controller.signal });
-      clearTimeout(timeout);
-      
-      if (!res.ok) continue;
-      const data = await res.json();
-      
-      if (data && data.audioStreams && data.audioStreams.length > 0) {
-        // Sort by bitrate descending
-        const streams = data.audioStreams.sort((a, b) => b.bitrate - a.bitrate);
-        return {
-          url: streams[0].url,
-          title: data.title,
-          artist: data.uploader,
-          thumbnail: data.thumbnailUrl,
-          duration: data.duration,
-          api: api
-        };
-      }
-    } catch (e) {
-      console.log(`   [PIPED] Failed ${api}: ${e.message}`);
-    }
-  }
-  throw new Error("All Piped instances failed");
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  GET /stream?id=  —  Extract audio URL
-// ═══════════════════════════════════════════════════════════════
-app.get("/stream", async (req, res) => {
-  const videoId = req.query.id;
-  console.log(`\n🎵 [STREAM] Extracting info for: ${videoId}`);
-
-  if (!videoId) {
-    return res.status(400).json({ status: "error", error: "Missing ?id= parameter" });
-  }
-
-  try {
-    const pipedData = await getPipedAudioUrl(videoId);
-    console.log(`✅ [STREAM] Selected from ${pipedData.api}`);
-
-    res.json({
-      status: "ok",
-      title: pipedData.title,
-      artist: pipedData.artist,
-      thumbnail: pipedData.thumbnail,
-      duration: pipedData.duration,
-      audioUrl: pipedData.url,
-      format: {
-        id: "piped",
-        ext: "m4a/webm",
-        bitrate: 128,
-        codec: "auto",
-      },
-    });
-  } catch (err) {
-    console.error(`❌ [STREAM] FAILED: ${err.message}`);
-    res.status(500).json({ status: "error", error: "Audio extraction failed", detail: err.message });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════
-//  GET /audio/:id  —  PROXY audio stream
-// ═══════════════════════════════════════════════════════════════
-app.get("/audio/:id", async (req, res) => {
-  const videoId = req.params.id;
-  console.log(`\n🔊 [AUDIO] Proxy stream request: ${videoId}`);
-
-  try {
-    const pipedData = await getPipedAudioUrl(videoId);
-    console.log(`   [AUDIO] Streaming from: ${pipedData.api}`);
-    
-    https.get(pipedData.url, (streamRes) => {
-      res.setHeader("Content-Type", streamRes.headers["content-type"] || "audio/webm");
-      if (streamRes.headers["content-length"]) {
-        res.setHeader("Content-Length", streamRes.headers["content-length"]);
-      }
-      
-      console.log(`   ✅ [AUDIO] Stream STARTED`);
-      let bytesStreamed = 0;
-      
-      streamRes.on("data", (chunk) => {
-        bytesStreamed += chunk.length;
-      });
-      
-      streamRes.on("end", () => {
-        const sizeMB = (bytesStreamed / (1024 * 1024)).toFixed(2);
-        console.log(`   ✅ [AUDIO] Stream COMPLETED — ${sizeMB} MB sent`);
-      });
-      
-      streamRes.pipe(res);
-      
-      req.on("close", () => {
-        streamRes.destroy();
-        console.log(`   🔇 [AUDIO] Client disconnected`);
-      });
-    }).on("error", (err) => {
-      console.error(`   ❌ [AUDIO] HTTPS GET ERROR: ${err.message}`);
-      if (!res.headersSent) res.status(500).json({ error: "Stream error" });
-    });
-    
-  } catch (err) {
-    console.error(`   ❌ [AUDIO] SETUP ERROR: ${err.message}`);
-    if (!res.headersSent) {
-      res.status(500).json({ status: "error", error: "Failed to setup audio stream", detail: err.message });
-    }
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════
-//  START SERVER
-// ═══════════════════════════════════════════════════════════════
-app.listen(PORT, "0.0.0.0", () => {
-  const publicUrl = process.env.PUBLIC_URL || "http://us.krishna.kajuhost.qzz.io:19132";
-
-  console.log("\n═══════════════════════════════════════════════════");
-  console.log("  Nitrozen Mobile API");
-  console.log("  Server Online");
-  console.log(`  Public URL:`);
-  console.log(`  ${publicUrl}`);
-  console.log(`  Port: ${PORT}`);
-  console.log("  ─────────────────────────────────────────────────");
-  console.log("  Endpoints:");
-  console.log("       GET /            -> Health check");
-  console.log("       GET /search?q=   -> Search YouTube");
-  console.log("       GET /stream?id=  -> Audio URL (JSON info)");
-  console.log("       GET /audio/:id   -> Proxy audio stream *");
-  console.log("═══════════════════════════════════════════════════\n");
-
-  // Check yt-dlp
-  const check = spawn("yt-dlp", ["--version"]);
-  check.stdout.on("data", (d) => {
-    console.log(`  [OK] yt-dlp installed: v${d.toString().trim()}`);
+shoukaku.on('disconnect', (name, players) => {
+  logger.warn(`Lavalink node ${name} disconnected`);
+  nodePool.markNodeFailure(name, 'DISCONNECTED');
+  
+  // Attempt to reconnect players to other nodes
+  players.forEach(player => {
+    const guildId = player.guildId;
+    logger.player(`Attempting to reconnect guild ${guildId}`);
+    // Reconnection logic would go here
   });
-  check.on("error", () => {
-    console.error("  [ERROR] yt-dlp NOT FOUND!");
-    console.error("  Please install it to use this backend:");
-    console.error("  Linux/Pterodactyl/Ubuntu:");
-    console.error("    pip install yt-dlp");
-    console.error("    or: pip3 install yt-dlp");
+});
+
+shoukaku.on('debug', (name, info) => {
+  logger.node(name, 'Debug', info);
+});
+
+// ═══════════════════════════════════════════════════════════════
+//  Start Server
+// ═══════════════════════════════════════════════════════════════
+
+const server = app.listen(PORT, '0.0.0.0', () => {
+  logger.success('═══════════════════════════════════════════════════');
+  logger.success('  Nitrozen Mobile API v4');
+  logger.success('  Lavalink Powered Music Streaming');
+  logger.success('  Server Online');
+  logger.success(`  Public URL: ${PUBLIC_URL}`);
+  logger.success(`  Port: ${PORT}`);
+  logger.success('  ─────────────────────────────────────────────────');
+  logger.success('  Lavalink Nodes:');
+  LAVALINK_NODES.forEach(node => {
+    logger.success(`    ${node.name}: ${node.host}:${node.port}`);
   });
+  logger.success('  ─────────────────────────────────────────────────');
+  logger.success('  API Endpoints:');
+  logger.success('       GET  /api/v1/              -> Health check');
+  logger.success('       GET  /api/v1/search?q=     -> Search YouTube');
+  logger.success('       POST /api/v1/player/play   -> Play track');
+  logger.success('       POST /api/v1/player/pause  -> Pause playback');
+  logger.success('       POST /api/v1/player/resume -> Resume playback');
+  logger.success('       POST /api/v1/player/seek   -> Seek position');
+  logger.success('       POST /api/v1/player/stop   -> Stop playback');
+  logger.success('       GET  /api/v1/queue/:id      -> Get queue');
+  logger.success('       POST /api/v1/queue/add     -> Add to queue');
+  logger.success('       POST /api/v1/queue/remove  -> Remove from queue');
+  logger.success('       POST /api/v1/queue/skip    -> Skip track');
+  logger.success('       POST /api/v1/queue/shuffle -> Shuffle queue');
+  logger.success('       DEL  /api/v1/queue/clear   -> Clear queue');
+  logger.success('       GET  /api/v1/nodes/status  -> Node status');
+  logger.success('  ─────────────────────────────────────────────────');
+  logger.success('  WebSocket:');
+  logger.success('       WS   /ws?guildId=          -> Real-time events');
+  logger.success('═══════════════════════════════════════════════════');
+  logger.info('Ready! Waiting for requests...\n');
+});
 
-  // Check ffmpeg (optional)
-  const ff = spawn("ffmpeg", ["-version"]);
-  ff.stdout.once("data", () => console.log("  [OK] ffmpeg installed"));
-  ff.on("error", () => console.log("  [WARN] ffmpeg not found (optional - some formats may be unavailable)"));
+// Create WebSocket server
+createWebSocketServer(server);
 
+// ═══════════════════════════════════════════════════════════════
+//  Health Check & Maintenance Intervals
+// ═══════════════════════════════════════════════════════════════
+
+// Node health check interval
+setInterval(async () => {
+  await nodePool.reconnectNodes(shoukaku);
+}, NODE_HEALTH_CHECK_INTERVAL);
+
+// Position update interval (simulate for now)
+setInterval(() => {
+  const sessions = playerService.getAllSessions();
+  sessions.forEach(session => {
+    if (session.isPlaying && !session.isPaused) {
+      session.position += POSITION_UPDATE_INTERVAL;
+      
+      // Broadcast position update
+      const { broadcastToGuild } = require('./routes/websocket');
+      broadcastToGuild(session.guildId, {
+        type: 'POSITION_UPDATE',
+        guildId: session.guildId,
+        position: session.position,
+        duration: session.currentTrack?.durationSeconds * 1000 || 0
+      });
+    }
+  });
+}, POSITION_UPDATE_INTERVAL);
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  logger.info('Shutting down gracefully...');
+  
+  // Disconnect Shoukaku
+  shoukaku.destroy();
+  
+  // Close server
+  server.close(() => {
+    logger.success('Server closed');
+    process.exit(0);
+  });
+  
+  // Force close after 10 seconds
   setTimeout(() => {
-    console.log("═══════════════════════════════════════════════════\n");
-    console.log("[INFO] Ready! Waiting for requests...\n");
-  }, 1500);
+    logger.error('Forced shutdown');
+    process.exit(1);
+  }, 10000);
 });
+
+module.exports = { app, shoukaku, nodePool, playerService };
