@@ -63,11 +63,48 @@ app.get("/search", async (req, res) => {
   }
 });
 
+const https = require("https");
 const ytdl = require("@distube/ytdl-core");
 
+// List of public Piped instances to avoid 429
+const PIPED_INSTANCES = [
+  "https://pipedapi.kavin.rocks",
+  "https://pipedapi.in.projectsegfau.lt",
+  "https://api.piped.projectsegfau.lt"
+];
+
+async function getPipedAudioUrl(videoId) {
+  for (const api of PIPED_INSTANCES) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      const res = await fetch(`${api}/streams/${videoId}`, { signal: controller.signal });
+      clearTimeout(timeout);
+      
+      if (!res.ok) continue;
+      const data = await res.json();
+      
+      if (data && data.audioStreams && data.audioStreams.length > 0) {
+        // Sort by bitrate descending
+        const streams = data.audioStreams.sort((a, b) => b.bitrate - a.bitrate);
+        return {
+          url: streams[0].url,
+          title: data.title,
+          artist: data.uploader,
+          thumbnail: data.thumbnailUrl,
+          duration: data.duration,
+          api: api
+        };
+      }
+    } catch (e) {
+      console.log(`   [PIPED] Failed ${api}: ${e.message}`);
+    }
+  }
+  throw new Error("All Piped instances failed");
+}
+
 // ═══════════════════════════════════════════════════════════════
-//  GET /stream?id=  —  Extract audio URL using ytdl-core (JSON)
-//  Returns direct audio URL + metadata. For debugging / mobile.
+//  GET /stream?id=  —  Extract audio URL
 // ═══════════════════════════════════════════════════════════════
 app.get("/stream", async (req, res) => {
   const videoId = req.query.id;
@@ -77,43 +114,22 @@ app.get("/stream", async (req, res) => {
     return res.status(400).json({ status: "error", error: "Missing ?id= parameter" });
   }
 
-  const url = `https://www.youtube.com/watch?v=${videoId}`;
-
   try {
-    console.log("   [EXTRACT] Running ytdl.getInfo ...");
-    const info = await ytdl.getInfo(url);
-    const details = info.videoDetails;
-
-    console.log(`   [VIDEO] Title: ${details.title}`);
-    console.log(`   [VIDEO] Channel: ${details.author.name}`);
-    console.log(`   [VIDEO] Duration: ${details.lengthSeconds}s`);
-
-    const audioFormats = ytdl.filterFormats(info.formats, "audioonly");
-    console.log(`   [FORMATS] Total: ${info.formats?.length || 0} | Audio-only: ${audioFormats.length}`);
-
-    if (!audioFormats.length) {
-      console.log("❌ [STREAM] No audio formats with valid URLs");
-      return res.status(404).json({ status: "error", error: "No playable audio formats found" });
-    }
-
-    // Sort by highest audio bitrate
-    audioFormats.sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0));
-    const best = audioFormats[0];
-
-    console.log(`✅ [STREAM] Selected: ${best.itag} (${best.container}, ${best.audioCodec}, ${best.audioBitrate}kbps)`);
+    const pipedData = await getPipedAudioUrl(videoId);
+    console.log(`✅ [STREAM] Selected from ${pipedData.api}`);
 
     res.json({
       status: "ok",
-      title: details.title,
-      artist: details.author.name,
-      thumbnail: details.thumbnails.length ? details.thumbnails[0].url : '',
-      duration: details.lengthSeconds,
-      audioUrl: best.url,
+      title: pipedData.title,
+      artist: pipedData.artist,
+      thumbnail: pipedData.thumbnail,
+      duration: pipedData.duration,
+      audioUrl: pipedData.url,
       format: {
-        id: best.itag,
-        ext: best.container,
-        bitrate: best.audioBitrate,
-        codec: best.audioCodec,
+        id: "piped",
+        ext: "m4a/webm",
+        bitrate: 128,
+        codec: "auto",
       },
     });
   } catch (err) {
@@ -123,58 +139,45 @@ app.get("/stream", async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-//  GET /audio/:id  —  PROXY audio stream via ytdl-core
-//  Most reliable! Pipes audio output directly to client.
+//  GET /audio/:id  —  PROXY audio stream
 // ═══════════════════════════════════════════════════════════════
 app.get("/audio/:id", async (req, res) => {
   const videoId = req.params.id;
-  const url = `https://www.youtube.com/watch?v=${videoId}`;
-
   console.log(`\n🔊 [AUDIO] Proxy stream request: ${videoId}`);
-  console.log(`   [AUDIO] URL: ${url}`);
-  console.log(`   [AUDIO] Spawning ytdl-core stream...`);
 
   try {
-    const stream = ytdl(url, {
-      filter: "audioonly",
-      quality: "highestaudio",
-      highWaterMark: 1 << 25, // 32MB buffer
-    });
-
-    let streamStarted = false;
-    let bytesStreamed = 0;
-
-    stream.on("response", (response) => {
-      streamStarted = true;
-      res.setHeader("Content-Type", response.headers["content-type"] || "audio/webm");
-      res.setHeader("Transfer-Encoding", "chunked");
-      console.log(`   ✅ [AUDIO] Stream STARTED — sending audio data...`);
-    });
-
-    stream.on("data", (chunk) => {
-      bytesStreamed += chunk.length;
-    });
-
-    stream.on("end", () => {
-      const sizeMB = (bytesStreamed / (1024 * 1024)).toFixed(2);
-      console.log(`   ✅ [AUDIO] Stream COMPLETED — ${sizeMB} MB sent`);
-    });
-
-    stream.on("error", (err) => {
-      console.error(`   ❌ [AUDIO] STREAM ERROR: ${err.message}`);
-      if (!res.headersSent) {
-        res.status(500).json({ status: "error", error: "Audio stream failed", detail: err.message });
-      } else {
-        res.end();
+    const pipedData = await getPipedAudioUrl(videoId);
+    console.log(`   [AUDIO] Streaming from: ${pipedData.api}`);
+    
+    https.get(pipedData.url, (streamRes) => {
+      res.setHeader("Content-Type", streamRes.headers["content-type"] || "audio/webm");
+      if (streamRes.headers["content-length"]) {
+        res.setHeader("Content-Length", streamRes.headers["content-length"]);
       }
+      
+      console.log(`   ✅ [AUDIO] Stream STARTED`);
+      let bytesStreamed = 0;
+      
+      streamRes.on("data", (chunk) => {
+        bytesStreamed += chunk.length;
+      });
+      
+      streamRes.on("end", () => {
+        const sizeMB = (bytesStreamed / (1024 * 1024)).toFixed(2);
+        console.log(`   ✅ [AUDIO] Stream COMPLETED — ${sizeMB} MB sent`);
+      });
+      
+      streamRes.pipe(res);
+      
+      req.on("close", () => {
+        streamRes.destroy();
+        console.log(`   🔇 [AUDIO] Client disconnected`);
+      });
+    }).on("error", (err) => {
+      console.error(`   ❌ [AUDIO] HTTPS GET ERROR: ${err.message}`);
+      if (!res.headersSent) res.status(500).json({ error: "Stream error" });
     });
-
-    req.on("close", () => {
-      stream.destroy();
-      console.log(`   🔇 [AUDIO] Client disconnected — destroyed stream`);
-    });
-
-    stream.pipe(res);
+    
   } catch (err) {
     console.error(`   ❌ [AUDIO] SETUP ERROR: ${err.message}`);
     if (!res.headersSent) {
